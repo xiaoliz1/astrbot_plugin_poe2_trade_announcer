@@ -7,6 +7,7 @@ import hashlib
 import json
 import logging
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
@@ -22,11 +23,50 @@ TRADE_HISTORY_LIMIT = 100
 SEEN_TRADE_LIMIT = 5000
 
 
+def _item_name_key(value: str) -> str:
+    return "".join(char.casefold() for char in value if char.isalnum())
+
+
+def _load_traditional_item_names() -> dict[str, str]:
+    try:
+        payload = json.loads(
+            Path(__file__).with_name("traditional_item_names.json").read_text(
+                encoding="utf-8"
+            )
+        )
+    except (OSError, json.JSONDecodeError):
+        LOGGER.exception("讀取繁體物品名稱表失敗")
+        return {}
+    rows = payload.get("items") if isinstance(payload, dict) else None
+    if not isinstance(rows, dict):
+        return {}
+    return {
+        str(key): str(value).strip()
+        for key, value in rows.items()
+        if key and isinstance(value, str) and value.strip()
+    }
+
+
+TRADITIONAL_ITEM_NAMES = _load_traditional_item_names()
+TRADITIONAL_CURRENCY_ALIASES = {
+    alias: TRADITIONAL_ITEM_NAMES.get(_item_name_key(full_name), "")
+    for alias, full_name in {
+        "annulment": "Annulment Orb",
+        "chaos": "Chaos Orb",
+        "divine": "Divine Orb",
+        "exalted": "Exalted Orb",
+        "mirror": "Mirror of Kalandra",
+        "regal": "Regal Orb",
+        "vaal": "Vaal Orb",
+    }.items()
+}
+
+
 @register(
     "astrbot_plugin_poe2_trade_announcer",
     "xiaoliz1",
     "PoE2 交易提醒",
-    "0.1.0",
+    "0.1.1",
 )
 class Poe2TradeAnnouncer(Star):
     """Poll PoE2 trade history and notify chats that explicitly subscribed."""
@@ -143,7 +183,8 @@ class Poe2TradeAnnouncer(Star):
         timeout = aiohttp.ClientTimeout(total=30)
         headers = {
             "Accept": "application/json",
-            "User-Agent": "AstrBotPoE2TradeAnnouncer/0.1.0",
+            "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
+            "User-Agent": "AstrBotPoE2TradeAnnouncer/0.1.1",
             "Cookie": f"POESESSID={session_id}",
         }
 
@@ -294,20 +335,41 @@ class Poe2TradeAnnouncer(Star):
         return str(message or "响应中没有交易列表").replace("\n", " ")[:300]
 
     @staticmethod
-    def _format_trade(trade: dict[str, Any], item: dict[str, Any]) -> str:
-        name = item.get("name") or item.get("typeLine") or item.get("baseType") or "未知物品"
-        price = trade.get("price") if isinstance(trade.get("price"), dict) else {}
+    def _traditional_item_name(item: dict[str, Any]) -> str:
+        candidates = [
+            str(item.get(field, "") or "").strip()
+            for field in ("name", "typeLine", "baseType")
+        ]
+        for candidate in candidates:
+            traditional = TRADITIONAL_ITEM_NAMES.get(_item_name_key(candidate))
+            if traditional:
+                return traditional
+        return "未收錄物品"
+
+    @staticmethod
+    def _traditional_price(price: dict[str, Any]) -> str:
         amount = price.get("amount")
-        currency = price.get("currency")
-        price_text = f"{amount} {currency}".strip() if amount is not None else "价格未提供"
-        league = item.get("league") or "未知赛季"
-        when = trade.get("time") or "时间未提供"
+        currency = str(price.get("currency", "") or "").strip()
+        if amount is None:
+            return "價格未提供"
+        normalized = _item_name_key(currency)
+        traditional = (
+            TRADITIONAL_ITEM_NAMES.get(normalized)
+            or TRADITIONAL_CURRENCY_ALIASES.get(normalized)
+        )
+        return f"{amount} {traditional or '未收錄通貨'}"
+
+    @staticmethod
+    def _format_trade(trade: dict[str, Any], item: dict[str, Any]) -> str:
+        name = Poe2TradeAnnouncer._traditional_item_name(item)
+        price = trade.get("price") if isinstance(trade.get("price"), dict) else {}
+        price_text = Poe2TradeAnnouncer._traditional_price(price)
+        when = trade.get("time") or "時間未提供"
         return (
-            "💰 PoE2 成交提醒\n"
+            "💰 PoE2 成交通知\n"
             f"物品：{name}\n"
-            f"价格：{price_text}\n"
-            f"赛季：{league}\n"
-            f"成交时间：{when}"
+            f"價格：{price_text}\n"
+            f"成交時間：{when}"
         )
 
     @staticmethod
@@ -320,16 +382,16 @@ class Poe2TradeAnnouncer(Star):
         await self._ensure_state_loaded()
         umo = self._current_umo(event)
         if not umo:
-            yield event.plain_result("无法识别当前会话，订阅未保存。")
+            yield event.plain_result("無法識別目前對話，訂閱未儲存。")
             return
         async with self._state_lock:
             self._subscribers.add(umo)
             await self.put_kv_data("subscribers", sorted(self._subscribers))
         if self._enabled() and self._session_id() and self._league_name():
-            yield event.plain_result("当前会话已订阅 PoE2 成交提醒。")
+            yield event.plain_result("目前對話已訂閱 PoE2 成交通知。")
         else:
             yield event.plain_result(
-                "当前会话已订阅；管理员还需在插件配置中启用监控并填写 POESESSID 与赛季名称。"
+                "目前對話已訂閱；管理員還需在外掛設定中啟用監控並填入 POESESSID 與賽季名稱。"
             )
 
     @filter.command("poe2交易退订")
@@ -341,7 +403,7 @@ class Poe2TradeAnnouncer(Star):
             existed = umo in self._subscribers
             self._subscribers.discard(umo)
             await self.put_kv_data("subscribers", sorted(self._subscribers))
-        message = "当前会话已取消成交提醒。" if existed else "当前会话没有订阅成交提醒。"
+        message = "目前對話已取消成交通知。" if existed else "目前對話尚未訂閱成交通知。"
         yield event.plain_result(message)
 
     @filter.command("poe2交易状态")
@@ -351,16 +413,16 @@ class Poe2TradeAnnouncer(Star):
         ready = self._enabled() and bool(self._session_id()) and bool(self._league_name())
         chat_subscribed = self._current_umo(event) in self._subscribers
         lines = [
-            f"交易监控：{'运行中' if ready else '未配置或未启用'}",
-            f"当前赛季：{self._league_name() or '未设置'}",
-            f"POESESSID：{'已配置' if self._session_id() else '未配置'}",
-            f"当前会话：{'已订阅' if chat_subscribed else '未订阅'}",
-            f"订阅会话数：{len(self._subscribers)}",
-            f"轮询间隔：{self._poll_interval_seconds() // 60} 分钟",
-            f"最近成功检查：{self._last_success_at or '尚无'}",
+            f"交易監控：{'執行中' if ready else '未設定或未啟用'}",
+            f"目前賽季：{self._league_name() or '未設定'}",
+            f"POESESSID：{'已設定' if self._session_id() else '未設定'}",
+            f"目前對話：{'已訂閱' if chat_subscribed else '未訂閱'}",
+            f"已訂閱對話數：{len(self._subscribers)}",
+            f"輪詢間隔：{self._poll_interval_seconds() // 60} 分鐘",
+            f"最近成功檢查：{self._last_success_at or '尚無'}",
         ]
         if self._last_error:
-            lines.append(f"最近错误：{self._last_error}")
+            lines.append("最近錯誤：請檢查賽季名稱、POESESSID 或網路連線。")
         yield event.plain_result("\n".join(lines))
 
     @filter.command("poe2交易历史")
@@ -369,19 +431,17 @@ class Poe2TradeAnnouncer(Star):
         await self._ensure_state_loaded()
         umo = self._current_umo(event)
         if umo not in self._subscribers:
-            yield event.plain_result("请先发送 /poe2交易订阅，再查看该账号的成交记录。")
+            yield event.plain_result("請先傳送 /poe2交易訂閱，再查看此對話的成交紀錄。")
             return
         if not self._trade_history:
-            yield event.plain_result("目前还没有交易记录；首次成功检查会建立历史基线。")
+            yield event.plain_result("目前尚無交易紀錄；首次成功檢查會建立歷史基線。")
             return
-        lines = ["最近 PoE2 成交记录："]
+        lines = ["最近 PoE2 成交紀錄："]
         for trade in self._trade_history[:10]:
             item = trade.get("item") if isinstance(trade.get("item"), dict) else {}
             price = trade.get("price") if isinstance(trade.get("price"), dict) else {}
-            name = item.get("name") or item.get("typeLine") or item.get("baseType") or "未知物品"
-            amount = price.get("amount")
-            currency = price.get("currency")
-            value = f"{amount} {currency}".strip() if amount is not None else "价格未提供"
-            when = trade.get("time") or "时间未提供"
+            name = self._traditional_item_name(item)
+            value = self._traditional_price(price)
+            when = trade.get("time") or "時間未提供"
             lines.append(f"- {name}｜{value}｜{when}")
         yield event.plain_result("\n".join(lines))
