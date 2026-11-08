@@ -13,13 +13,6 @@
     "obvious_hint": true,
     "hint": "仅用于兼容旧版管理员订阅；普通用户请私聊机器人使用 /poe2交易设置，禁止在群聊中发送。"
   },
-  "league_name": {
-    "type": "string",
-    "description": "当前交易赛季名称",
-    "default": "",
-    "obvious_hint": true,
-    "hint": "需与 pathofexile2.com 交易历史 API 的赛季名称完全一致。赛季更新时请同步修改。"
-  },
   "poll_interval_minutes": {
     "type": "int",
     "description": "轮询间隔（分钟，最低 15 分钟）",

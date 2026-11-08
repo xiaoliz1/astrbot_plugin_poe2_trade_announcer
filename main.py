@@ -8,6 +8,7 @@ import hashlib
 import json
 import logging
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -22,6 +23,10 @@ from astrbot.api.star import Context, Star, register
 LOGGER = logging.getLogger("astrbot_plugin_poe2_trade_announcer")
 TRADE_HISTORY_LIMIT = 100
 SEEN_TRADE_LIMIT = 5000
+SCOUT_LEAGUES_URL = "https://api.poe2scout.com/poe2/Leagues"
+LEAGUE_CACHE_SECONDS = 300
+SCOUT_MAX_JSON_BYTES = 2_000_000
+TRADE_DETAIL_LIMIT = 3
 
 
 def _item_name_key(value: str) -> str:
@@ -49,17 +54,22 @@ def _load_traditional_item_names() -> dict[str, str]:
 
 
 TRADITIONAL_ITEM_NAMES = _load_traditional_item_names()
+TRADITIONAL_CURRENCY_ENGLISH_NAMES = {
+    "annulment": "Annulment Orb",
+    "chaos": "Chaos Orb",
+    "divine": "Divine Orb",
+    "exalted": "Exalted Orb",
+    "mirror": "Mirror of Kalandra",
+    "regal": "Regal Orb",
+    "vaal": "Vaal Orb",
+}
 TRADITIONAL_CURRENCY_ALIASES = {
     alias: TRADITIONAL_ITEM_NAMES.get(_item_name_key(full_name), "")
-    for alias, full_name in {
-        "annulment": "Annulment Orb",
-        "chaos": "Chaos Orb",
-        "divine": "Divine Orb",
-        "exalted": "Exalted Orb",
-        "mirror": "Mirror of Kalandra",
-        "regal": "Regal Orb",
-        "vaal": "Vaal Orb",
-    }.items()
+    for alias, full_name in TRADITIONAL_CURRENCY_ENGLISH_NAMES.items()
+}
+TRADITIONAL_CURRENCY_CANONICAL_KEYS = {
+    alias: _item_name_key(full_name)
+    for alias, full_name in TRADITIONAL_CURRENCY_ENGLISH_NAMES.items()
 }
 
 
@@ -67,7 +77,7 @@ TRADITIONAL_CURRENCY_ALIASES = {
     "astrbot_plugin_poe2_trade_announcer",
     "xiaoliz1",
     "PoE2 交易提醒",
-    "0.2.1",
+    "0.2.2",
 )
 class Poe2TradeAnnouncer(Star):
     """Poll separate PoE2 trade histories for users who explicitly subscribe."""
@@ -77,9 +87,13 @@ class Poe2TradeAnnouncer(Star):
         self.config = config
         self._poll_task: asyncio.Task[None] | None = None
         self._state_lock = asyncio.Lock()
+        self._league_cache_lock = asyncio.Lock()
         self._state_loaded = False
         self._legacy_state = self._new_account_state()
         self._user_states: dict[str, dict[str, Any]] = {}
+        self._league_cache_name = ""
+        self._league_cache_expires_at = 0.0
+        self._league_discovery_error: str | None = None
         self._poll_task = asyncio.create_task(self._poll_loop())
 
     async def terminate(self) -> None:
@@ -92,11 +106,15 @@ class Poe2TradeAnnouncer(Star):
     def _new_account_state() -> dict[str, Any]:
         return {
             "session_id": "",
+            "private_umo": "",
             "owner_name": "",
+            "league_name": "",
             "subscribers": [],
             "seen_trade_ids": [],
             "trade_history": [],
             "baseline_ready": False,
+            "session_invalid": False,
+            "invalid_session_fingerprint": "",
             "last_success_at": None,
             "last_error": None,
         }
@@ -110,7 +128,9 @@ class Poe2TradeAnnouncer(Star):
             return state
         if include_session_id:
             state["session_id"] = str(payload.get("session_id", "") or "").strip()
+        state["private_umo"] = str(payload.get("private_umo", "") or "").strip()
         state["owner_name"] = str(payload.get("owner_name", "") or "").strip()
+        state["league_name"] = str(payload.get("league_name", "") or "").strip()
         subscribers = payload.get("subscribers", [])
         if isinstance(subscribers, list):
             state["subscribers"] = sorted(
@@ -127,6 +147,10 @@ class Poe2TradeAnnouncer(Star):
                 trade for trade in trades if isinstance(trade, dict)
             ][:TRADE_HISTORY_LIMIT]
         state["baseline_ready"] = bool(payload.get("baseline_ready"))
+        state["session_invalid"] = bool(payload.get("session_invalid"))
+        state["invalid_session_fingerprint"] = str(
+            payload.get("invalid_session_fingerprint", "") or ""
+        ).strip()
         last_success = payload.get("last_success_at")
         state["last_success_at"] = str(last_success) if last_success else None
         last_error = payload.get("last_error")
@@ -138,11 +162,17 @@ class Poe2TradeAnnouncer(Star):
         state: dict[str, Any], include_session_id: bool
     ) -> dict[str, Any]:
         payload = {
+            "private_umo": state.get("private_umo", ""),
             "owner_name": state.get("owner_name", ""),
+            "league_name": state.get("league_name", ""),
             "subscribers": sorted(set(state.get("subscribers", []))),
             "seen_trade_ids": state.get("seen_trade_ids", [])[:SEEN_TRADE_LIMIT],
             "trade_history": state.get("trade_history", [])[:TRADE_HISTORY_LIMIT],
             "baseline_ready": bool(state.get("baseline_ready")),
+            "session_invalid": bool(state.get("session_invalid")),
+            "invalid_session_fingerprint": state.get(
+                "invalid_session_fingerprint", ""
+            ),
             "last_success_at": state.get("last_success_at"),
             "last_error": state.get("last_error"),
         }
@@ -236,8 +266,85 @@ class Poe2TradeAnnouncer(Star):
         """Read the optional legacy administrator session configured in WebUI."""
         return str(self.config.get("poe2_session_id", "") or "").strip()
 
-    def _league_name(self) -> str:
-        return str(self.config.get("league_name", "") or "").strip()
+    async def _resolved_league_name(self) -> str:
+        loop = asyncio.get_running_loop()
+        now = loop.time()
+        if now < self._league_cache_expires_at:
+            return self._league_cache_name
+
+        async with self._league_cache_lock:
+            now = loop.time()
+            if now < self._league_cache_expires_at:
+                return self._league_cache_name
+            try:
+                timeout = aiohttp.ClientTimeout(total=20)
+                headers = {
+                    "Accept": "application/json",
+                    "User-Agent": "AstrBotPoE2TradeAnnouncer/0.2.2",
+                }
+                async with aiohttp.ClientSession(
+                    timeout=timeout, headers=headers
+                ) as session:
+                    async with session.get(SCOUT_LEAGUES_URL) as response:
+                        if response.status != 200:
+                            raise RuntimeError(f"Poe2Scout HTTP {response.status}")
+                        body = await response.content.read(SCOUT_MAX_JSON_BYTES + 1)
+                        if len(body) > SCOUT_MAX_JSON_BYTES:
+                            raise ValueError("Poe2Scout 回應超過大小限制")
+                        payload = json.loads(body)
+
+                if not isinstance(payload, list):
+                    raise ValueError("Poe2Scout 賽季資料格式不正確")
+                current = next(
+                    (
+                        item
+                        for item in payload
+                        if isinstance(item, dict) and item.get("IsCurrent") is True
+                    ),
+                    None,
+                )
+                if current is None:
+                    raise ValueError("Poe2Scout 未標記目前賽季")
+                league_name = current.get("Value")
+                if (
+                    not isinstance(league_name, str)
+                    or not 0 < len(league_name.strip()) <= 100
+                ):
+                    raise ValueError("Poe2Scout 目前賽季名稱無效")
+
+                self._league_cache_name = league_name.strip()
+                self._league_cache_expires_at = now + LEAGUE_CACHE_SECONDS
+                self._league_discovery_error = None
+                return self._league_cache_name
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self._league_discovery_error = str(exc).replace("\n", " ")[:200]
+                self._league_cache_expires_at = now + 60
+                LOGGER.warning(
+                    "Poe2Scout 目前賽季自動識別失敗：%s",
+                    self._league_discovery_error,
+                )
+                # Continue with the last known league during a short API outage.
+                return self._league_cache_name
+
+    @staticmethod
+    def _session_fingerprint(session_id: str) -> str:
+        return hashlib.sha256(session_id.encode("utf-8")).hexdigest()
+
+    @classmethod
+    def _session_is_paused(cls, state: dict[str, Any], session_id: str) -> bool:
+        if not state.get("session_invalid"):
+            return False
+        if state.get("invalid_session_fingerprint") == cls._session_fingerprint(
+            session_id
+        ):
+            return True
+        state["session_invalid"] = False
+        state["invalid_session_fingerprint"] = ""
+        if str(state.get("last_error", "")).startswith("Session ID 驗證失敗"):
+            state["last_error"] = None
+        return False
 
     def _poll_interval_seconds(self) -> int:
         try:
@@ -251,26 +358,56 @@ class Poe2TradeAnnouncer(Star):
         not_ready_signature: tuple[bool, bool] | None = None
         while True:
             try:
-                ready = (self._enabled(), bool(self._league_name()))
-                if all(ready):
+                enabled = self._enabled()
+                league = await self._resolved_league_name() if enabled else ""
+                ready = (enabled, bool(league))
+                if enabled and league:
                     not_ready_signature = None
-                    legacy_session = self._session_id()
-                    if legacy_session and self._legacy_state["subscribers"]:
-                        await self._poll_account(None, legacy_session)
-
+                    poll_targets: list[tuple[str | None, str]] = []
+                    legacy_state_changed = False
+                    user_states_changed = False
                     async with self._state_lock:
-                        configured_users = [
-                            (account_key, str(state.get("session_id", "")))
-                            for account_key, state in self._user_states.items()
-                            if state.get("session_id") and state.get("subscribers")
-                        ]
-                    for account_key, session_id in configured_users:
-                        await self._poll_account(account_key, session_id)
+                        legacy_session = self._session_id()
+                        if legacy_session and self._legacy_state["subscribers"]:
+                            was_invalid = bool(
+                                self._legacy_state.get("session_invalid")
+                            )
+                            is_paused = self._session_is_paused(
+                                self._legacy_state, legacy_session
+                            )
+                            if not is_paused:
+                                poll_targets.append((None, legacy_session))
+                            if was_invalid and not self._legacy_state.get(
+                                "session_invalid"
+                            ):
+                                legacy_state_changed = True
+
+                        for account_key, state in self._user_states.items():
+                            session_id = str(state.get("session_id", ""))
+                            if not session_id or not state.get("subscribers"):
+                                continue
+                            was_invalid = bool(state.get("session_invalid"))
+                            is_paused = self._session_is_paused(state, session_id)
+                            if not is_paused:
+                                poll_targets.append((account_key, session_id))
+                            if was_invalid and not state.get("session_invalid"):
+                                user_states_changed = True
+
+                        if legacy_state_changed:
+                            await self._save_legacy_state_locked()
+                        if user_states_changed:
+                            await self._save_user_states_locked()
+
+                    for account_key, session_id in poll_targets:
+                        await self._poll_account(account_key, session_id, league)
                 elif ready != not_ready_signature:
                     not_ready_signature = ready
-                    LOGGER.info(
-                        "交易监控暫未執行：請在外掛設定中啟用監控並填寫目前賽季名稱。"
-                    )
+                    if not enabled:
+                        LOGGER.info("交易監控暫未執行：請在外掛設定中啟用監控。")
+                    else:
+                        LOGGER.info(
+                            "交易監控暫未執行：無法從 Poe2Scout 取得目前賽季。"
+                        )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -278,9 +415,8 @@ class Poe2TradeAnnouncer(Star):
             await asyncio.sleep(self._poll_interval_seconds())
 
     async def _poll_account(
-        self, account_key: str | None, session_id: str
+        self, account_key: str | None, session_id: str, league: str
     ) -> None:
-        league = self._league_name()
         endpoint = (
             "https://www.pathofexile.com/api/trade2/history/"
             f"{quote(league, safe='')}"
@@ -289,22 +425,18 @@ class Poe2TradeAnnouncer(Star):
         headers = {
             "Accept": "application/json",
             "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
-            "User-Agent": "AstrBotPoE2TradeAnnouncer/0.2.1",
+            "User-Agent": "AstrBotPoE2TradeAnnouncer/0.2.2",
             "Cookie": f"POESESSID={session_id}",
         }
 
         try:
             async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
                 async with session.get(endpoint) as response:
-                    body = await response.text()
-                    try:
-                        payload = json.loads(body)
-                    except json.JSONDecodeError:
-                        await self._set_account_error(
-                            account_key, session_id, "交易 API 返回了无法解析的响应。"
+                    if response.status in {401, 403}:
+                        await self._mark_session_invalid(
+                            account_key, session_id, response.status
                         )
                         return
-
                     if response.status == 429:
                         await self._set_account_error(
                             account_key, session_id, "交易 API 限流，將於下次輪詢重試。"
@@ -312,15 +444,30 @@ class Poe2TradeAnnouncer(Star):
                         LOGGER.warning("交易 API 限流，帳號鍵：%s", account_key or "legacy")
                         return
                     if response.status >= 400:
+                        if response.status == 400:
+                            message = (
+                                f"交易 API 賽季請求失敗（HTTP 400）；"
+                                f"Poe2Scout 識別的賽季為「{league}」。"
+                            )
+                        else:
+                            message = f"交易 API 請求失敗（HTTP {response.status}）。"
                         await self._set_account_error(
                             account_key,
                             session_id,
-                            f"交易 API 請求失敗（HTTP {response.status}）。",
+                            message,
                         )
                         LOGGER.warning(
                             "交易 API 請求失敗（HTTP %s），帳號鍵：%s",
                             response.status,
                             account_key or "legacy",
+                        )
+                        return
+                    body = await response.text()
+                    try:
+                        payload = json.loads(body)
+                    except json.JSONDecodeError:
+                        await self._set_account_error(
+                            account_key, session_id, "交易 API 返回了无法解析的响应。"
                         )
                         return
         except asyncio.CancelledError:
@@ -343,13 +490,19 @@ class Poe2TradeAnnouncer(Star):
             return
         if not isinstance(payload.get("result"), list):
             await self._set_account_error(
-                account_key, session_id, "未取得交易紀錄，請檢查 Session ID 和賽季名稱。"
+                account_key,
+                session_id,
+                f"交易賽季「{league}」未返回成交列表：{self._api_error_message(payload)}",
             )
-            LOGGER.warning("交易 API 未返回交易列表，帳號鍵：%s", account_key or "legacy")
+            LOGGER.warning(
+                "交易賽季未返回成交列表（%s），帳號鍵：%s",
+                league,
+                account_key or "legacy",
+            )
             return
 
         trades = [trade for trade in payload["result"] if isinstance(trade, dict)]
-        await self._record_snapshot(account_key, session_id, trades)
+        await self._record_snapshot(account_key, session_id, league, trades)
         await self._mark_account_success(account_key, session_id)
 
     async def _set_account_error(
@@ -373,6 +526,64 @@ class Poe2TradeAnnouncer(Star):
                 await self._save_legacy_state_locked()
             else:
                 await self._save_user_states_locked()
+
+    async def _mark_session_invalid(
+        self, account_key: str | None, session_id: str, status_code: int
+    ) -> None:
+        """Pause a rejected session and send one private notice to its owner."""
+        owner_umo = ""
+        should_notify = False
+        fingerprint = self._session_fingerprint(session_id)
+        async with self._state_lock:
+            state = (
+                self._legacy_state
+                if account_key is None
+                else self._user_states.get(account_key)
+            )
+            if not state:
+                return
+            if account_key is None:
+                if self._session_id() != session_id:
+                    return
+            elif state.get("session_id") != session_id:
+                return
+
+            should_notify = not (
+                state.get("session_invalid")
+                and state.get("invalid_session_fingerprint") == fingerprint
+            )
+            state["session_invalid"] = True
+            state["invalid_session_fingerprint"] = fingerprint
+            state["last_error"] = (
+                f"Session ID 驗證失敗（HTTP {status_code}）；此帳號輪詢已暫停。"
+            )
+            owner_umo = str(state.get("private_umo", "") or "").strip()
+            if account_key is None:
+                await self._save_legacy_state_locked()
+            else:
+                await self._save_user_states_locked()
+
+        if not should_notify:
+            return
+        if not owner_umo:
+            LOGGER.info(
+                "Session ID 已失效但帳號沒有可用的私聊會話，無法主動通知；帳號鍵：%s",
+                account_key or "legacy",
+            )
+            return
+
+        message = (
+            f"Path of Exile 交易 API 拒絕了你的 Session ID（HTTP {status_code}），"
+            "該帳號交易輪詢已暫停。"
+            "請私聊機器人重新發送 /poe2交易设置 <POESESSID>；"
+            "不需要重新訂閱群聊。"
+        )
+        try:
+            await self.context.send_message(
+                owner_umo, MessageChain([Plain(message)])
+            )
+        except Exception:
+            LOGGER.exception("私聊通知 Session ID 失效失敗；帳號鍵：%s", account_key)
 
     async def _mark_account_success(
         self, account_key: str | None, session_id: str
@@ -403,6 +614,7 @@ class Poe2TradeAnnouncer(Star):
         self,
         account_key: str | None,
         session_id: str,
+        league: str,
         trades: list[dict[str, Any]],
     ) -> None:
         await self._ensure_state_loaded()
@@ -429,14 +641,36 @@ class Poe2TradeAnnouncer(Star):
             elif state.get("session_id") != session_id:
                 return
 
+            previous_league = str(state.get("league_name", "") or "").strip()
+            preserve_migrated_history = False
+            if previous_league and previous_league != league:
+                state["seen_trade_ids"] = []
+                state["trade_history"] = []
+                state["baseline_ready"] = False
+                state["last_success_at"] = None
+                state["last_error"] = None
+            elif not previous_league and state["baseline_ready"]:
+                # Older releases did not persist the league per account. Rebaseline
+                # once on upgrade so another season's trades are not announced.
+                state["seen_trade_ids"] = []
+                state["baseline_ready"] = False
+                preserve_migrated_history = True
+            state["league_name"] = league
+
             existing_ids = set(state["seen_trade_ids"])
             if not state["baseline_ready"]:
                 state["seen_trade_ids"] = [trade_id for trade_id, _ in current][
                     :SEEN_TRADE_LIMIT
                 ]
-                state["trade_history"] = [trade for _, trade in current][
-                    :TRADE_HISTORY_LIMIT
-                ]
+                current_history = [trade for _, trade in current]
+                if preserve_migrated_history:
+                    current_ids = {trade_id for trade_id, _ in current}
+                    current_history.extend(
+                        trade
+                        for trade in state["trade_history"]
+                        if self._trade_id(trade) not in current_ids
+                    )
+                state["trade_history"] = current_history[:TRADE_HISTORY_LIMIT]
                 state["baseline_ready"] = True
                 LOGGER.info(
                     "交易历史初始基线已记录 %s 笔，不会把历史成交作为新通知发送。",
@@ -478,38 +712,42 @@ class Poe2TradeAnnouncer(Star):
                 )
             return
 
-        for _, trade in reversed(new_trades):
-            await self._send_trade_to_recipients(
-                trade, recipients, owner_name, account_key
-            )
+        await self._send_trades_to_recipients(
+            [trade for _, trade in reversed(new_trades)],
+            recipients,
+            owner_name,
+            account_key,
+        )
 
-    async def _send_trade_to_recipients(
+    async def _send_trades_to_recipients(
         self,
-        trade: dict[str, Any],
+        trades: list[dict[str, Any]],
         recipients: list[str],
         owner_name: str,
         account_key: str | None,
     ) -> None:
-        item = trade.get("item") if isinstance(trade.get("item"), dict) else {}
+        if not trades:
+            return
         safe_owner_name = " ".join(str(owner_name or "群友").split())[:40]
-        text = self._format_trade(trade, item)
-        if account_key is None:
-            text = f"👤 管理員帳號\n{text}"
+        text = self._format_trade_batch(trades, safe_owner_name)
         sender_id = account_key.rsplit(":", 1)[-1] if account_key else ""
-        icon = str(item.get("icon", "") or "").strip()
+        icons: list[str] = []
+        for trade in trades[:TRADE_DETAIL_LIMIT]:
+            item = trade.get("item") if isinstance(trade.get("item"), dict) else {}
+            icon = str(item.get("icon", "") or "").strip()
+            if icon.startswith(("https://", "http://")):
+                icons.append(icon)
+
         for umo in recipients:
             mention_components: list[Any] = []
-            should_mention = bool(
-                sender_id and self._is_group_umo(umo)
-            )
+            should_mention = bool(sender_id and self._is_group_umo(umo))
             if should_mention:
                 mention_components.extend(
                     [At(qq=sender_id, name=safe_owner_name), Plain("\n")]
                 )
             text_components = [*mention_components, Plain(text)]
             components = list(text_components)
-            if icon.startswith(("https://", "http://")):
-                components.append(Image.fromURL(icon))
+            components.extend(Image.fromURL(icon) for icon in icons)
             try:
                 sent = await self.context.send_message(umo, MessageChain(components))
                 if not sent and len(components) > len(text_components):
@@ -574,29 +812,107 @@ class Poe2TradeAnnouncer(Star):
         currency = str(price.get("currency", "") or "").strip()
         if amount is None:
             return "價格未提供"
-        normalized = _item_name_key(currency)
-        traditional = (
-            TRADITIONAL_ITEM_NAMES.get(normalized)
-            or TRADITIONAL_CURRENCY_ALIASES.get(normalized)
-        )
-        return f"{amount} {traditional or '未收錄通貨'}"
+        currency_name = Poe2TradeAnnouncer._traditional_currency_name(currency)
+        return f"{amount} {currency_name}"
 
     @staticmethod
-    def _format_trade(trade: dict[str, Any], item: dict[str, Any]) -> str:
+    def _traditional_currency_name(currency: str) -> str:
+        normalized = _item_name_key(currency)
+        return (
+            TRADITIONAL_ITEM_NAMES.get(normalized)
+            or TRADITIONAL_CURRENCY_ALIASES.get(normalized)
+            or "未收錄通貨"
+        )
+
+    @staticmethod
+    def _format_trade_detail(trade: dict[str, Any]) -> str:
+        item = trade.get("item") if isinstance(trade.get("item"), dict) else {}
         name = Poe2TradeAnnouncer._traditional_item_name(item)
         price = trade.get("price") if isinstance(trade.get("price"), dict) else {}
         price_text = Poe2TradeAnnouncer._traditional_price(price)
         when = trade.get("time") or "時間未提供"
-        return (
-            "💰 PoE2 成交通知\n"
-            f"物品：{name}\n"
-            f"價格：{price_text}\n"
-            f"成交時間：{when}"
+        return f"- {name}｜{price_text}｜{when}"
+
+    @staticmethod
+    def _format_trade_batch(trades: list[dict[str, Any]], owner_name: str) -> str:
+        totals: dict[str, Decimal] = {}
+        currency_names: dict[str, str] = {}
+        priced_trades = 0
+        for trade in trades:
+            price = trade.get("price") if isinstance(trade.get("price"), dict) else {}
+            amount = price.get("amount")
+            currency = str(price.get("currency", "") or "").strip()
+            if amount is None or not currency:
+                continue
+            try:
+                numeric_amount = Decimal(str(amount))
+            except (InvalidOperation, ValueError):
+                continue
+            if not numeric_amount.is_finite():
+                continue
+            normalized_currency = _item_name_key(currency)
+            currency_key = TRADITIONAL_CURRENCY_CANONICAL_KEYS.get(
+                normalized_currency, normalized_currency or currency.casefold()
+            )
+            totals[currency_key] = totals.get(currency_key, Decimal("0")) + numeric_amount
+            currency_names[currency_key] = Poe2TradeAnnouncer._traditional_currency_name(
+                currency
+            )
+            priced_trades += 1
+
+        if totals:
+            formatted_totals = []
+            for currency_key, amount in totals.items():
+                amount_text = format(amount.normalize(), "f")
+                if "." in amount_text:
+                    amount_text = amount_text.rstrip("0").rstrip(".")
+                formatted_totals.append(
+                    f"{amount_text} {currency_names[currency_key]}"
+                )
+            total_label = (
+                "報價合計"
+                if priced_trades == len(trades)
+                else "可統計報價合計"
+            )
+            summary = f"{total_label}：{' + '.join(formatted_totals)}"
+        else:
+            summary = "報價資訊不完整，無法統計總額"
+
+        lines = [
+            f"💰 {owner_name} 的 PoE2 成交通知",
+            f"本輪新增 {len(trades)} 筆；{summary}",
+        ]
+        lines.extend(
+            Poe2TradeAnnouncer._format_trade_detail(trade)
+            for trade in trades[:TRADE_DETAIL_LIMIT]
         )
+        hidden_count = len(trades) - TRADE_DETAIL_LIMIT
+        if hidden_count > 0:
+            lines.append(f"另有 {hidden_count} 筆成交未展開。")
+        return "\n".join(lines)
 
     @staticmethod
     def _current_umo(event: AstrMessageEvent) -> str:
         return str(getattr(event, "unified_msg_origin", "") or "").strip()
+
+    async def _remember_private_umo(
+        self, event: AstrMessageEvent, account_key: str
+    ) -> None:
+        if not event.is_private_chat() or not account_key:
+            return
+        private_umo = self._current_umo(event)
+        if not private_umo:
+            return
+        async with self._state_lock:
+            state = self._user_states.get(account_key)
+            if not state or not state.get("session_id"):
+                return
+            if state.get("private_umo") == private_umo:
+                return
+            previous_umo = state.get("private_umo", "")
+            state["private_umo"] = private_umo
+            if not await self._save_user_states_locked():
+                state["private_umo"] = previous_umo
 
     @staticmethod
     def _is_group_umo(umo: str) -> bool:
@@ -669,6 +985,8 @@ class Poe2TradeAnnouncer(Star):
             "1. 登录 pathofexile.com，在浏览器按 F12，打开 Application/应用程序 → Cookies → https://www.pathofexile.com，复制 POESESSID 的 Value。\n"
             "2. 只在与机器人的私聊中发送：/poe2交易设置 <POESESSID>。\n"
             "3. 到需要接收通知的群发送：/poe2交易订阅。每位群友绑定和收到的成交通知互相独立；有新成交时群里会 @ 你。\n"
+            "当前赛季由 Poe2Scout 自动识别。每轮新成交会合并为一条通知；交易 API 返回 HTTP 401/403 时会暂停该账号轮询并私聊提醒重新设置。\n"
+            "旧版本已绑定用户升级后，请私聊发送一次 /poe2交易状态 以登记提醒会话；无需重新发送 Session ID。\n"
             "其他指令：/poe2交易状态、/poe2交易历史、/poe2交易退订、/poe2交易清除。\n"
             "POESESSID 等同账号登录凭据，绝不要发到群里；它会保存在 AstrBot 本机插件数据中，管理员及主机备份可能可以访问。/poe2交易清除只删除本插件保存的副本。"
         )
@@ -704,7 +1022,12 @@ class Poe2TradeAnnouncer(Star):
                 state["last_success_at"] = None
                 state["last_error"] = None
             state["session_id"] = session_id
+            state["private_umo"] = self._current_umo(event)
             state["owner_name"] = self._sender_name(event)
+            state["session_invalid"] = False
+            state["invalid_session_fingerprint"] = ""
+            if str(state.get("last_error", "")).startswith("Session ID 驗證失敗"):
+                state["last_error"] = None
             self._user_states[account_key] = state
             saved = await self._save_user_states_locked()
             if not saved:
@@ -758,11 +1081,16 @@ class Poe2TradeAnnouncer(Star):
         if not account_key or not umo:
             yield event.plain_result("無法識別目前對話，訂閱未儲存。")
             return
+        await self._remember_private_umo(event, account_key)
 
+        invalid_session = False
         async with self._state_lock:
             previous = copy.deepcopy(self._user_states.get(account_key))
             state = copy.deepcopy(previous) if previous else self._new_account_state()
             if not state.get("session_id"):
+                saved = None
+            elif self._session_is_paused(state, str(state["session_id"])):
+                invalid_session = True
                 saved = None
             else:
                 state["owner_name"] = self._sender_name(event)
@@ -775,17 +1103,23 @@ class Poe2TradeAnnouncer(Star):
                     else:
                         self._user_states[account_key] = previous
 
-        if saved is None:
+        if invalid_session:
+            yield event.plain_result(
+                "你的 Session ID 已失效，請先私聊機器人重新發送 /poe2交易设置 <POESESSID>；原有群訂閱會保留。"
+            )
+        elif saved is None:
             yield event.plain_result(
                 "請先私聊機器人發送 /poe2交易设置 <POESESSID>，再回到群裡訂閱。"
             )
         elif not saved:
             yield event.plain_result("保存失敗，請稍後重試；本次訂閱未確認保存。")
-        elif self._enabled() and self._league_name():
-            yield event.plain_result("已訂閱此對話；你的新成交通知會在群裡 @ 你。")
+        elif self._enabled():
+            yield event.plain_result(
+                "已訂閱此對話；你的新成交通知會在群裡 @ 你，賽季由 Poe2Scout 自動識別。"
+            )
         else:
             yield event.plain_result(
-                "已保存你的訂閱；機器人管理員還需啟用監控並設定目前賽季。"
+                "已保存你的訂閱；機器人管理員還需啟用交易監控。"
             )
 
     @filter.command("poe2交易退订")
@@ -797,6 +1131,7 @@ class Poe2TradeAnnouncer(Star):
         if not account_key or not umo:
             yield event.plain_result("無法識別目前對話。")
             return
+        await self._remember_private_umo(event, account_key)
         async with self._state_lock:
             previous = copy.deepcopy(self._user_states.get(account_key))
             if previous is None:
@@ -824,21 +1159,30 @@ class Poe2TradeAnnouncer(Star):
         if not account_key:
             yield event.plain_result("無法識別你的平台帳號。")
             return
+        await self._remember_private_umo(event, account_key)
+        league = await self._resolved_league_name()
         async with self._state_lock:
             state = copy.deepcopy(
                 self._user_states.get(account_key, self._new_account_state())
             )
         active = bool(
             self._enabled()
-            and self._league_name()
+            and league
             and state.get("session_id")
             and state["subscribers"]
+            and not state.get("session_invalid")
         )
         chat_subscribed = self._current_umo(event) in state["subscribers"]
+        if state.get("session_invalid"):
+            session_status = "已失效（輪詢已暫停）"
+        elif state.get("session_id"):
+            session_status = "已設定"
+        else:
+            session_status = "未設定"
         lines = [
             f"你的通知監控：{'執行中' if active else '未啟用／尚未完成設定'}",
-            f"目前賽季：{self._league_name() or '未設定'}",
-            f"你的 Session ID：{'已設定' if state.get('session_id') else '未設定'}",
+            f"目前賽季：{league or '無法取得'}",
+            f"你的 Session ID：{session_status}",
             f"目前對話：{'你已訂閱' if chat_subscribed else '你未訂閱'}",
             f"你的訂閱對話數：{len(state['subscribers'])}",
             f"輪詢間隔：{self._poll_interval_seconds() // 60} 分鐘",
@@ -846,6 +1190,10 @@ class Poe2TradeAnnouncer(Star):
         ]
         if state["last_error"]:
             lines.append(f"最近錯誤：{state['last_error']}")
+        if self._league_discovery_error:
+            lines.append(
+                f"Poe2Scout 賽季識別錯誤：{self._league_discovery_error}；系統會自動重試。"
+            )
         yield event.plain_result("\n".join(lines))
 
     @filter.command("poe2交易历史")
@@ -857,6 +1205,7 @@ class Poe2TradeAnnouncer(Star):
         if not account_key:
             yield event.plain_result("無法識別你的平台帳號。")
             return
+        await self._remember_private_umo(event, account_key)
         async with self._state_lock:
             state = copy.deepcopy(self._user_states.get(account_key))
         if not event.is_private_chat() and (
