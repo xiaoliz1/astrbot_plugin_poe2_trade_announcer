@@ -1,7 +1,7 @@
 name: astrbot_plugin_poe2_trade_announcer
 display_name: PoE2 交易提醒
-short_desc: 定时检查 PoE2 交易历史，并向主动订阅的 AstrBot 会话推送成交提醒。
-desc: 基于 Fabio Pineda 的 poe2-trade-announcer-bot 移植。每 15 分钟或更长时间检查 PoE2 交易历史，支持成交图片通知、会话订阅与最近成交记录。需要配置 POESESSID 和当前赛季名称；群聊需主动发送订阅命令才会收到提醒。
-version: v0.1.1
+short_desc: 按用户独立绑定 PoE2 账号，并向已订阅的群聊推送成交提醒。
+desc: 基于 Fabio Pineda 的 poe2-trade-announcer-bot 移植。每位用户可在私聊中绑定自己的 Session ID，独立订阅群聊、查询成交历史并接收繁体中文成交通知。管理员需设置当前赛季并启用监控。
+version: v0.2.0
 author: xiaoliz1
 astrbot_version: ">=4.24.2,<5"

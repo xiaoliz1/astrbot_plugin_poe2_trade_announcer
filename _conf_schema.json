@@ -8,10 +8,10 @@
   },
   "poe2_session_id": {
     "type": "string",
-    "description": "PoE2 的 POESESSID Cookie",
+    "description": "旧版管理员账号的 POESESSID（可选）",
     "default": "",
     "obvious_hint": true,
-    "hint": "敏感登录会话凭据。请只在 AstrBot 插件配置页填写，不要发到群聊或提交到代码仓库。"
+    "hint": "仅用于兼容旧版管理员订阅；普通用户请私聊机器人使用 /poe2交易设置，禁止在群聊中发送。"
   },
   "league_name": {
     "type": "string",
