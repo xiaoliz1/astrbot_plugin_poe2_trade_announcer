@@ -15,7 +15,7 @@ from urllib.parse import quote
 import aiohttp
 from astrbot.api import AstrBotConfig
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
-from astrbot.api.message_components import Image, Plain
+from astrbot.api.message_components import At, Image, Plain
 from astrbot.api.star import Context, Star, register
 
 
@@ -67,7 +67,7 @@ TRADITIONAL_CURRENCY_ALIASES = {
     "astrbot_plugin_poe2_trade_announcer",
     "xiaoliz1",
     "PoE2 交易提醒",
-    "0.2.0",
+    "0.2.1",
 )
 class Poe2TradeAnnouncer(Star):
     """Poll separate PoE2 trade histories for users who explicitly subscribe."""
@@ -289,7 +289,7 @@ class Poe2TradeAnnouncer(Star):
         headers = {
             "Accept": "application/json",
             "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
-            "User-Agent": "AstrBotPoE2TradeAnnouncer/0.2.0",
+            "User-Agent": "AstrBotPoE2TradeAnnouncer/0.2.1",
             "Cookie": f"POESESSID={session_id}",
         }
 
@@ -480,33 +480,49 @@ class Poe2TradeAnnouncer(Star):
 
         for _, trade in reversed(new_trades):
             await self._send_trade_to_recipients(
-                trade, recipients, owner_name
+                trade, recipients, owner_name, account_key
             )
 
     async def _send_trade_to_recipients(
-        self, trade: dict[str, Any], recipients: list[str], owner_name: str
+        self,
+        trade: dict[str, Any],
+        recipients: list[str],
+        owner_name: str,
+        account_key: str | None,
     ) -> None:
         item = trade.get("item") if isinstance(trade.get("item"), dict) else {}
         safe_owner_name = " ".join(str(owner_name or "群友").split())[:40]
-        text = f"👤 {safe_owner_name} 的帳號\n" + self._format_trade(trade, item)
+        text = self._format_trade(trade, item)
+        if account_key is None:
+            text = f"👤 管理員帳號\n{text}"
+        sender_id = account_key.rsplit(":", 1)[-1] if account_key else ""
         icon = str(item.get("icon", "") or "").strip()
         for umo in recipients:
+            mention_components: list[Any] = []
+            should_mention = bool(
+                sender_id and self._is_group_umo(umo)
+            )
+            if should_mention:
+                mention_components.extend(
+                    [At(qq=sender_id, name=safe_owner_name), Plain("\n")]
+                )
+            text_components = [*mention_components, Plain(text)]
+            components = list(text_components)
+            if icon.startswith(("https://", "http://")):
+                components.append(Image.fromURL(icon))
             try:
-                components: list[Any] = [Plain(text)]
-                if icon.startswith(("https://", "http://")):
-                    components.append(Image.fromURL(icon))
                 sent = await self.context.send_message(umo, MessageChain(components))
-                if not sent and len(components) > 1:
+                if not sent and len(components) > len(text_components):
                     sent = await self.context.send_message(
-                        umo, MessageChain([Plain(text)])
+                        umo, MessageChain(text_components)
                     )
                 if not sent:
                     LOGGER.warning("向已订阅会话发送成交提醒失败：%s", umo)
             except Exception:
-                if icon.startswith(("https://", "http://")):
+                if len(components) > len(text_components):
                     try:
                         sent = await self.context.send_message(
-                            umo, MessageChain([Plain(text)])
+                            umo, MessageChain(text_components)
                         )
                         if sent:
                             continue
@@ -583,6 +599,14 @@ class Poe2TradeAnnouncer(Star):
         return str(getattr(event, "unified_msg_origin", "") or "").strip()
 
     @staticmethod
+    def _is_group_umo(umo: str) -> bool:
+        parts = umo.split(":", 2)
+        if len(parts) != 3:
+            return False
+        message_type = parts[1].replace("_", "").casefold()
+        return message_type == "groupmessage"
+
+    @staticmethod
     def _account_key(event: AstrMessageEvent) -> str:
         platform_id = str(event.get_platform_id() or "").strip()
         sender_id = str(event.get_sender_id() or "").strip()
@@ -644,7 +668,7 @@ class Poe2TradeAnnouncer(Star):
             "PoE2 交易通知使用方法：\n"
             "1. 登录 pathofexile.com，在浏览器按 F12，打开 Application/应用程序 → Cookies → https://www.pathofexile.com，复制 POESESSID 的 Value。\n"
             "2. 只在与机器人的私聊中发送：/poe2交易设置 <POESESSID>。\n"
-            "3. 到需要接收通知的群发送：/poe2交易订阅。每位群友绑定和收到的成交通知互相独立。\n"
+            "3. 到需要接收通知的群发送：/poe2交易订阅。每位群友绑定和收到的成交通知互相独立；有新成交时群里会 @ 你。\n"
             "其他指令：/poe2交易状态、/poe2交易历史、/poe2交易退订、/poe2交易清除。\n"
             "POESESSID 等同账号登录凭据，绝不要发到群里；它会保存在 AstrBot 本机插件数据中，管理员及主机备份可能可以访问。/poe2交易清除只删除本插件保存的副本。"
         )
@@ -758,7 +782,7 @@ class Poe2TradeAnnouncer(Star):
         elif not saved:
             yield event.plain_result("保存失敗，請稍後重試；本次訂閱未確認保存。")
         elif self._enabled() and self._league_name():
-            yield event.plain_result("已訂閱此對話；收到的成交通知只對應你的帳號。")
+            yield event.plain_result("已訂閱此對話；你的新成交通知會在群裡 @ 你。")
         else:
             yield event.plain_result(
                 "已保存你的訂閱；機器人管理員還需啟用監控並設定目前賽季。"
