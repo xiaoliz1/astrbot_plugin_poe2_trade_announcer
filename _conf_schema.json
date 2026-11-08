@@ -1,0 +1,29 @@
+{
+  "monitor_enabled": {
+    "type": "bool",
+    "description": "启用交易历史轮询和成交提醒",
+    "default": false,
+    "obvious_hint": true,
+    "hint": "首次启动不会补发旧交易，只会建立基线。"
+  },
+  "poe2_session_id": {
+    "type": "string",
+    "description": "PoE2 的 POESESSID Cookie",
+    "default": "",
+    "obvious_hint": true,
+    "hint": "敏感登录会话凭据。请只在 AstrBot 插件配置页填写，不要发到群聊或提交到代码仓库。"
+  },
+  "league_name": {
+    "type": "string",
+    "description": "当前交易赛季名称",
+    "default": "",
+    "obvious_hint": true,
+    "hint": "需与 pathofexile2.com 交易历史 API 的赛季名称完全一致。赛季更新时请同步修改。"
+  },
+  "poll_interval_minutes": {
+    "type": "int",
+    "description": "轮询间隔（分钟，最低 15 分钟）",
+    "default": 15,
+    "hint": "插件会将小于 15 的值按 15 分钟处理，避免过于频繁访问交易 API。"
+  }
+}
